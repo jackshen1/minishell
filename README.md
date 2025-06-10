@@ -14,4 +14,4 @@ A lightweight Unix-style shell written in C.
 
 ## Notes
 
-Originally written as a systems programming assignment (Columbia CS3157).
+Originally written as an Advanced Programming (Columbia CS3157) assignment.
