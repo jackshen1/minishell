@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <pwd.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #define CMD_BUFFER_SIZE 1024
 #define BRIGHTBLUE "\x1b[34;1m"
@@ -15,7 +16,82 @@
 #define MAX_ARGS 2048
 #define MAX_PIPE_CMDS 64
 
+typedef struct {
+    char *args[MAX_ARGS];  // command + arguments
+    int num_args;
+    char *input_file;      // NULL if no input redirection
+    char *output_file;     // NULL if no output redirection
+    int append_mode;       // 0 for >, 1 for >>
+} command_t;
+
 volatile sig_atomic_t interrupted = 0;
+
+int tokenize(const char *input, char **tokens, const char *delim, int max_tokens) {
+    int num_tokens = 0;
+    int in_quotes = 0;
+    char quote_char = 0;
+    int token_start = -1;
+    int len = strlen(input);
+    
+    for (int i = 0; i < len && num_tokens < max_tokens - 1; i++) {
+        char c = input[i];
+        
+        // Handle quotes
+        if ((c == '"' || c == '\'') && !in_quotes) {
+            in_quotes = 1;
+            quote_char = c;
+            token_start = i + 1;  // Start token after quote
+        }
+        else if (c == quote_char && in_quotes) {
+            in_quotes = 0;
+            // End current token
+            if (token_start != -1) {
+                int token_len = i - token_start;
+                tokens[num_tokens] = malloc(token_len + 1);
+                strncpy(tokens[num_tokens], input + token_start, token_len);
+                tokens[num_tokens][token_len] = '\0';
+                num_tokens++;
+                token_start = -1;
+            }
+        }
+        // Handle delimiters (only when not in quotes)
+        else if (!in_quotes && strchr(delim, c)) {
+            if (token_start != -1) {
+                // End current token
+                int token_len = i - token_start;
+                tokens[num_tokens] = malloc(token_len + 1);
+                strncpy(tokens[num_tokens], input + token_start, token_len);
+                tokens[num_tokens][token_len] = '\0';
+                num_tokens++;
+                token_start = -1;
+            }
+        }
+        // Start new token if needed
+        else if (token_start == -1 && !isspace(c)) {
+            token_start = i;
+        }
+    }
+    
+    // Handle last token
+    if (token_start != -1) {
+        int token_len = len - token_start;
+        tokens[num_tokens] = malloc(token_len + 1);
+        strncpy(tokens[num_tokens], input + token_start, token_len);
+        tokens[num_tokens][token_len] = '\0';
+        num_tokens++;
+    }
+    
+    tokens[num_tokens] = NULL;
+    return num_tokens;
+}
+
+int is_empty(const char *str) {
+    if (!str) return 1;
+    for (int i = 0; str[i]; i++) {
+        if (str[i] != ' ') return 0;
+    }
+    return 1;
+}
 
 void handle_sigint(int sig) {
     interrupted = 1;
@@ -25,13 +101,7 @@ void handle_sigint(int sig) {
 void execute_pipeline(char *input) {
     char *cmds[MAX_PIPE_CMDS];
     int num_cmds = 0;
-
-    char *token = strtok(input, "|");
-    while (token != NULL && num_cmds < MAX_PIPE_CMDS) {
-        cmds[num_cmds++] = token;
-        token = strtok(NULL, "|");
-    }
-
+    num_cmds = tokenize(input, cmds, "|", MAX_PIPE_CMDS);
     int prev_fd[2] = {-1, -1};
 
     for (int i = 0; i < num_cmds; i++) {
@@ -40,7 +110,72 @@ void execute_pipeline(char *input) {
             fprintf(stderr, "Error: pipe() failed. %s.\n", strerror(errno));
             return;
         }
+        
+        command_t cmd;
+        cmd.input_file = NULL;
+        cmd.output_file = NULL;
+        cmd.append_mode = 0;
+        cmd.num_args = 0;
+            
+        char *tokens[MAX_ARGS];
+        int num_tokens = tokenize(cmds[i], tokens, " ", MAX_ARGS);
+        
+        if (num_tokens == 0) {
+            fprintf(stderr, "Error: Empty Command.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (strcmp(tokens[0], ">") == 0 || strcmp(tokens[0], ">>") == 0 || strcmp(tokens[0], "<") == 0) {
+            fprintf(stderr, "Error: Invalid Command.\n");
+            exit(EXIT_FAILURE);
+        }
+        
+        for (int j = 0; j < num_tokens - 1; j++) {
+            if (strcmp(tokens[j], "<") == 0) {
+                if (cmd.input_file) {
+                    fprintf(stderr, "Error: Multiple input redirections not allowed.\n");
+                    exit(EXIT_FAILURE);
+                }
 
+                if (is_empty(tokens[j + 1]) || strcmp(tokens[j + 1], "<") == 0 || strcmp(tokens[j + 1], ">") == 0 || strcmp(tokens[j + 1], ">>") == 0) {
+                    fprintf(stderr, "Error: Invalid filename after '<'.\n");
+                    exit(EXIT_FAILURE);
+                }
+                cmd.input_file = tokens[j + 1];
+                j++;
+            }
+            else if (strcmp(tokens[j], ">") == 0) {
+                if (cmd.output_file) {
+                    fprintf(stderr, "Error: Multiple output redirections not allowed.\n");
+                    exit(EXIT_FAILURE);
+                }
+
+                if (is_empty(tokens[j + 1]) || strcmp(tokens[j + 1], "<") == 0 || strcmp(tokens[j + 1], ">") == 0 || strcmp(tokens[j + 1], ">>") == 0) {
+                    fprintf(stderr, "Error: Invalid filename after '>'.\n");
+                    exit(EXIT_FAILURE);
+                }
+                cmd.output_file = tokens[j + 1];
+                j++;
+            }
+            else if (strcmp(tokens[j], ">>") == 0) {
+                if (cmd.output_file) {
+                    fprintf(stderr, "Error: Multiple output redirections not allowed.\n");
+                    exit(EXIT_FAILURE);
+                }
+
+                if (is_empty(tokens[j + 1]) || strcmp(tokens[j + 1], "<") == 0 || strcmp(tokens[j + 1], ">") == 0 || strcmp(tokens[j + 1], ">>") == 0) {
+                    fprintf(stderr, "Error: Invalid filename after '>>'.\n");
+                    exit(EXIT_FAILURE);
+                }
+                cmd.output_file = tokens[j + 1];
+                cmd.append_mode = 1;
+                j++;
+            }
+            else {
+                cmd.args[cmd.num_args++] = tokens[j];
+            }
+        }
+        cmd.args[cmd.num_args] = NULL;
+       
         pid_t pid = fork();
         if (pid == 0) {
             if (i > 0) {
@@ -53,15 +188,30 @@ void execute_pipeline(char *input) {
                 dup2(pipefd[1], STDOUT_FILENO);
                 close(pipefd[1]);
             }
-            char *args[MAX_ARGS];
-            int j = 0;
-            char *arg = strtok(cmds[i], " ");
-            while (arg != NULL && j < MAX_ARGS - 1) {
-                args[j++] = arg;
-                arg = strtok(NULL, " ");
+            if (cmd.input_file) {
+                int input_fd = open(cmd.input_file, O_RDONLY);
+                if (input_fd == -1) {
+                    fprintf(stderr, "Error: Cannot open input file '%s'. %s.\n", cmd.input_file, strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+                dup2(input_fd, STDIN_FILENO);
+                close(input_fd);
             }
-            args[j] = NULL;
-            execvp(args[0], args);
+            if (cmd.output_file) {
+                int output_fd;
+                if (cmd.append_mode) {
+                    output_fd = open(cmd.output_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                } else {
+                    output_fd = open(cmd.output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                }
+                if (output_fd == -1) {
+                    fprintf(stderr, "Error: Cannot open output file '%s'. %s.\n", cmd.output_file, strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+                dup2(output_fd, STDOUT_FILENO);
+                close(output_fd);
+            }
+            execvp(cmd.args[0], cmd.args);
             fprintf(stderr, "Error: exec() failed. %s.\n", strerror(errno));
             exit(EXIT_FAILURE);
         } else if (pid > 0) {
